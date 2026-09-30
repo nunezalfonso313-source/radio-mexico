@@ -46,6 +46,7 @@ li .meta{font-size:.75rem;color:var(--tenue)}
   <input id="buscar" type="search" placeholder="Buscar emisora…" autocomplete="off">
   <div class="fila">
     <select id="calidad" aria-label="Calidad máxima">
+      <option value="48">Ahorro estricto (hasta 48 kbps)</option>
       <option value="64">Ahorro (hasta 64 kbps)</option>
       <option value="96">Media (hasta 96 kbps)</option>
       <option value="128" selected>Normal (hasta 128 kbps)</option>
@@ -105,6 +106,7 @@ function filtrar(lista, o) {
   return lista.filter(function (e) {
     if (o.soloHttps && !e.https) return false;
     if (o.maxKbps && e.kbps && e.kbps > o.maxKbps) return false;
+    if (o.maxKbps && o.maxKbps <= 48 && !e.kbps) return false;
     if (o.soloFavs && (o.favs || []).indexOf(e.id) === -1) return false;
     if (t && e.nombre.toLowerCase().indexOf(t) === -1) return false;
     return true;
@@ -293,6 +295,11 @@ function iniciar() {
 
   function pintar() {
     var lista = filtrar(estaciones, opciones());
+    if (opciones().maxKbps && opciones().maxKbps <= 48) {
+      lista = lista.slice().sort(function (a, b) {
+        return (/aac\+/i.test(b.codec) ? 1 : 0) - (/aac\+/i.test(a.codec) ? 1 : 0);
+      });
+    }
     var ul = $('lista');
     ul.textContent = '';
     lista.slice(0, MAX_VISIBLES).forEach(function (e) {
