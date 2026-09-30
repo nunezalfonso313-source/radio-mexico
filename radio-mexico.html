@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="es-MX">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0f172a">
+<title>Radio México</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icono-192.png">
+<style>
+:root{--fondo:#0f172a;--panel:#1e293b;--texto:#e2e8f0;--tenue:#94a3b8;--acento:#22c55e}
+*{box-sizing:border-box}
+body{margin:0;background:var(--fondo);color:var(--texto);font-family:system-ui,sans-serif;padding-bottom:110px}
+header{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;position:sticky;top:0;background:var(--fondo);z-index:2}
+h1{font-size:1.15rem;margin:0}
+#datos{font-size:.8rem;color:var(--tenue);text-align:right}
+#datos b{color:var(--acento)}
+#datos button{background:none;border:0;color:var(--tenue);text-decoration:underline;font-size:.75rem;padding:0;margin-left:6px}
+.controles{padding:0 16px 8px}
+input[type=search],select{width:100%;padding:11px;border-radius:10px;border:1px solid #334155;background:var(--panel);color:var(--texto);font-size:1rem}
+.fila{display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap}
+.fila select{flex:1;min-width:150px}
+.fila label{font-size:.85rem;color:var(--tenue);display:flex;gap:5px;align-items:center}
+#estado{padding:6px 16px;font-size:.8rem;color:var(--tenue)}
+ul{list-style:none;margin:0;padding:0 12px}
+li{display:flex;align-items:center;gap:8px;background:var(--panel);border-radius:12px;padding:10px 12px;margin-bottom:8px}
+li.activa{outline:2px solid var(--acento)}
+li .info{flex:1;min-width:0;cursor:pointer}
+li .nombre{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+li .meta{font-size:.75rem;color:var(--tenue)}
+.estrella{background:none;border:0;font-size:1.4rem;color:var(--tenue);padding:6px}
+.estrella.on{color:#facc15}
+#reproductor{position:fixed;left:0;right:0;bottom:0;background:#020617;border-top:1px solid #334155;padding:12px 16px;display:flex;align-items:center;gap:12px}
+#reproductor .txt{flex:1;min-width:0}
+#rNombre{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#rEstado{font-size:.75rem;color:var(--tenue)}
+#btnPlay{width:52px;height:52px;border-radius:50%;border:0;background:var(--acento);color:#052e16;font-size:1.4rem}
+</style>
+</head>
+<body>
+<header>
+  <h1>📻 Radio México</h1>
+  <div id="datos">Consumo: <b id="mb">0.0</b> MB<button id="btnReset" type="button">reiniciar</button></div>
+</header>
+<section class="controles">
+  <input id="buscar" type="search" placeholder="Buscar emisora…" autocomplete="off">
+  <div class="fila">
+    <select id="calidad" aria-label="Calidad máxima">
+      <option value="64">Ahorro (hasta 64 kbps)</option>
+      <option value="96">Media (hasta 96 kbps)</option>
+      <option value="128" selected>Normal (hasta 128 kbps)</option>
+      <option value="0">Todas</option>
+    </select>
+    <label><input type="checkbox" id="favs"> Favoritas</label>
+  </div>
+</section>
+<div id="estado">Cargando emisoras…</div>
+<ul id="lista"></ul>
+<div id="reproductor">
+  <div class="txt"><div id="rNombre">Elige una emisora</div><div id="rEstado">Detenido</div></div>
+  <button id="btnPlay" type="button" aria-label="Reproducir o pausar">▶</button>
+</div>
+<audio id="audio" preload="none"></audio>
+
+<script>
+'use strict';
+var SERVIDORES = [
+  'https://de1.api.radio-browser.info',
+  'https://de2.api.radio-browser.info',
+  'https://fi1.api.radio-browser.info',
+  'https://at1.api.radio-browser.info'
+];
+var RUTA = '/json/stations/search?countrycode=MX&hidebroken=true&order=clickcount&reverse=true&limit=400';
+var KBPS_DEFECTO = 64;
+var MAX_VISIBLES = 200;
+var CACHE_MS = 24 * 3600 * 1000;
+
+/* ---------- Lógica pura (se prueba aparte) ---------- */
+function normalizar(raw) {
+  var vistos = {}, salida = [];
+  (raw || []).forEach(function (s) {
+    var url = s.url_resolved || s.url || '';
+    if (!url || !s.name || s.hls === 1) return;
+    var nombre = String(s.name).trim();
+    var clave = nombre.toLowerCase();
+    if (!nombre || vistos[clave]) return;
+    vistos[clave] = true;
+    salida.push({
+      id: s.stationuuid || clave,
+      nombre: nombre,
+      url: url,
+      https: url.indexOf('https://') === 0,
+      kbps: Number(s.bitrate) || 0,
+      codec: s.codec || '',
+      estado: s.state || ''
+    });
+  });
+  return salida;
+}
+
+function filtrar(lista, o) {
+  var t = (o.texto || '').trim().toLowerCase();
+  return lista.filter(function (e) {
+    if (o.soloHttps && !e.https) return false;
+    if (o.maxKbps && e.kbps && e.kbps > o.maxKbps) return false;
+    if (o.soloFavs && (o.favs || []).indexOf(e.id) === -1) return false;
+    if (t && e.nombre.toLowerCase().indexOf(t) === -1) return false;
+    return true;
+  });
+}
+
+function megas(segundos, kbps) {
+  return segundos * (kbps || KBPS_DEFECTO) / 8 / 1000;
+}
+
+/* ---------- Almacenamiento ---------- */
+function leer(k, def) {
+  try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : def; } catch (e) { return def; }
+}
+function guardar(k, v) {
+  try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {}
+}
+
+/* ---------- Aplicación ---------- */
+function iniciar() {
+  var $ = function (id) { return document.getElementById(id); };
+  var audio = $('audio');
+  var estaciones = [];
+  var favs = leer('rm_favs', []);
+  var totalMB = leer('rm_mb', 0);
+  var actual = null;
+  var t0 = null;
+  var timerConteo = null;
+
+  $('calidad').value = String(leer('rm_calidad', 128));
+  pintarMB();
+
+  function pintarMB() { $('mb').textContent = totalMB.toFixed(1); }
+
+  function cerrarTramo() {
+    if (t0 === null) return;
+    var seg = (Date.now() - t0) / 1000;
+    totalMB += megas(seg, actual && actual.kbps);
+    t0 = Date.now();
+    guardar('rm_mb', totalMB);
+    pintarMB();
+  }
+  function detenerConteo() {
+    cerrarTramo();
+    t0 = null;
+    clearInterval(timerConteo);
+    timerConteo = null;
+  }
+  function iniciarConteo() {
+    if (t0 === null) t0 = Date.now();
+    if (!timerConteo) timerConteo = setInterval(cerrarTramo, 5000);
+  }
+
+  function estado(txt) { $('rEstado').textContent = txt; }
+
+  function reproducir(e) {
+    detenerConteo();
+    actual = e;
+    audio.src = e.url;
+    $('rNombre').textContent = e.nombre;
+    estado('Conectando…');
+    audio.play().catch(function () { estado('No se pudo reproducir. Prueba otra emisora.'); });
+    if ('mediaSession' in navigator && window.MediaMetadata) {
+      navigator.mediaSession.metadata = new MediaMetadata({ title: e.nombre, artist: 'Radio México' });
+      navigator.mediaSession.setActionHandler('play', function () { audio.play(); });
+      navigator.mediaSession.setActionHandler('pause', function () { audio.pause(); });
+    }
+    pintar();
+  }
+
+  audio.addEventListener('playing', function () { estado('Reproduciendo' + (actual && actual.kbps ? ' · ' + actual.kbps + ' kbps' : '')); iniciarConteo(); $('btnPlay').textContent = '⏸'; });
+  audio.addEventListener('pause', function () { estado('En pausa'); detenerConteo(); $('btnPlay').textContent = '▶'; });
+  audio.addEventListener('waiting', function () { estado('Cargando…'); });
+  audio.addEventListener('ended', function () { detenerConteo(); $('btnPlay').textContent = '▶'; });
+  audio.addEventListener('error', function () { estado('Error con esta emisora. Prueba otra.'); detenerConteo(); $('btnPlay').textContent = '▶'; });
+
+  $('btnPlay').addEventListener('click', function () {
+    if (!actual) return;
+    if (audio.paused) { audio.play().catch(function () { estado('No se pudo reproducir.'); }); } else { audio.pause(); }
+  });
+  $('btnReset').addEventListener('click', function () { totalMB = 0; guardar('rm_mb', 0); pintarMB(); });
+
+  function opciones() {
+    return {
+      texto: $('buscar').value,
+      maxKbps: Number($('calidad').value),
+      soloHttps: true,
+      soloFavs: $('favs').checked,
+      favs: favs
+    };
+  }
+
+  function pintar() {
+    var lista = filtrar(estaciones, opciones());
+    var ul = $('lista');
+    ul.textContent = '';
+    lista.slice(0, MAX_VISIBLES).forEach(function (e) {
+      var li = document.createElement('li');
+      if (actual && actual.id === e.id) li.className = 'activa';
+
+      var info = document.createElement('div');
+      info.className = 'info';
+      var n = document.createElement('div');
+      n.className = 'nombre';
+      n.textContent = e.nombre;
+      var m = document.createElement('div');
+      m.className = 'meta';
+      m.textContent = (e.kbps ? e.kbps + ' kbps' : 'kbps ?') + (e.codec ? ' · ' + e.codec : '') + (e.estado ? ' · ' + e.estado : '');
+      info.appendChild(n);
+      info.appendChild(m);
+      info.addEventListener('click', function () { reproducir(e); });
+
+      var est = document.createElement('button');
+      est.type = 'button';
+      est.className = 'estrella' + (favs.indexOf(e.id) !== -1 ? ' on' : '');
+      est.textContent = '★';
+      est.setAttribute('aria-label', 'Favorita');
+      est.addEventListener('click', function () {
+        var i = favs.indexOf(e.id);
+        if (i === -1) favs.push(e.id); else favs.splice(i, 1);
+        guardar('rm_favs', favs);
+        pintar();
+      });
+
+      li.appendChild(info);
+      li.appendChild(est);
+      ul.appendChild(li);
+    });
+    var extra = lista.length > MAX_VISIBLES ? ' (mostrando ' + MAX_VISIBLES + ')' : '';
+    $('estado').textContent = lista.length + ' emisoras' + extra + ' · solo con conexión segura (https)';
+  }
+
+  ['input', 'change'].forEach(function (ev) {
+    $('buscar').addEventListener(ev, pintar);
+    $('favs').addEventListener(ev, pintar);
+  });
+  $('calidad').addEventListener('change', function () { guardar('rm_calidad', Number($('calidad').value)); pintar(); });
+
+  async function cargar() {
+    var cache = leer('rm_cache', null);
+    if (cache && cache.lista && Date.now() - cache.t < CACHE_MS) return cache.lista;
+    var ultimo = new Error('Sin respuesta');
+    for (var i = 0; i < SERVIDORES.length; i++) {
+      try {
+        var r = await fetch(SERVIDORES[i] + RUTA);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        var lista = normalizar(await r.json());
+        if (!lista.length) throw new Error('Lista vacía');
+        guardar('rm_cache', { t: Date.now(), lista: lista });
+        return lista;
+      } catch (e) { ultimo = e; }
+    }
+    if (cache && cache.lista) return cache.lista;
+    throw ultimo;
+  }
+
+  cargar().then(function (l) { estaciones = l; pintar(); })
+    .catch(function () { $('estado').textContent = 'No se pudo cargar el directorio. Revisa tu conexión.'; });
+
+  if ('serviceWorker' in navigator && location.protocol.indexOf('http') === 0) {
+    navigator.serviceWorker.register('sw.js').catch(function () {});
+  }
+}
+
+if (typeof document !== 'undefined') {
+  iniciar();
+} else if (typeof globalThis !== 'undefined') {
+  globalThis.__radio = { normalizar: normalizar, filtrar: filtrar, megas: megas };
+}
+</script>
+</body>
+</html>
