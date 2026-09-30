@@ -35,6 +35,11 @@ li .meta{font-size:.75rem;color:var(--tenue)}
 #rNombre{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #rEstado{font-size:.75rem;color:var(--tenue)}
 #btnPlay{width:52px;height:52px;border-radius:50%;border:0;background:var(--acento);color:#052e16;font-size:1.4rem}
+details{padding:0 16px 8px}
+summary{color:var(--tenue);font-size:.85rem;padding:4px 0}
+details input{margin-top:8px}
+#pAgregar{margin-top:8px;padding:10px 16px;border:0;border-radius:10px;background:var(--acento);color:#052e16;font-size:1rem}
+#pMsg{font-size:.8rem;color:var(--tenue);margin-top:6px}
 </style>
 </head>
 <body>
@@ -55,6 +60,13 @@ li .meta{font-size:.75rem;color:var(--tenue)}
     <label><input type="checkbox" id="favs"> Favoritas</label>
   </div>
 </section>
+<details id="propias">
+  <summary>＋ Agregar emisora</summary>
+  <input id="pNombre" type="text" placeholder="Nombre de la emisora" autocomplete="off">
+  <input id="pUrl" type="url" placeholder="Enlace del stream (https://…)" autocomplete="off">
+  <button id="pAgregar" type="button">Agregar</button>
+  <div id="pMsg"></div>
+</details>
 <div id="estado">Cargando emisoras…</div>
 <ul id="lista"></ul>
 <div id="reproductor">
@@ -106,7 +118,7 @@ function filtrar(lista, o) {
   return lista.filter(function (e) {
     if (o.soloHttps && !e.https) return false;
     if (o.maxKbps && e.kbps && e.kbps > o.maxKbps) return false;
-    if (o.maxKbps && o.maxKbps <= 48 && !e.kbps) return false;
+    if (o.maxKbps && o.maxKbps <= 48 && !e.kbps && !e.propia) return false;
     if (o.soloFavs && (o.favs || []).indexOf(e.id) === -1) return false;
     if (t && e.nombre.toLowerCase().indexOf(t) === -1) return false;
     return true;
@@ -131,6 +143,7 @@ function iniciar() {
   var audio = $('audio');
   var estaciones = [];
   var favs = leer('rm_favs', []);
+  var propias = leer('rm_propias', []);
   var totalMB = leer('rm_mb', 0);
   var actual = null;
   var t0 = null;
@@ -294,7 +307,7 @@ function iniciar() {
   }
 
   function pintar() {
-    var lista = filtrar(estaciones, opciones());
+    var lista = filtrar(propias.concat(estaciones), opciones());
     if (opciones().maxKbps && opciones().maxKbps <= 48) {
       lista = lista.slice().sort(function (a, b) {
         return (/aac\+/i.test(b.codec) ? 1 : 0) - (/aac\+/i.test(a.codec) ? 1 : 0);
@@ -331,6 +344,19 @@ function iniciar() {
       });
 
       li.appendChild(info);
+      if (e.propia) {
+        var del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'estrella';
+        del.textContent = '✕';
+        del.setAttribute('aria-label', 'Quitar');
+        del.addEventListener('click', function () {
+          propias = propias.filter(function (p) { return p.id !== e.id; });
+          guardar('rm_propias', propias);
+          pintar();
+        });
+        li.appendChild(del);
+      }
       li.appendChild(est);
       ul.appendChild(li);
     });
@@ -344,23 +370,75 @@ function iniciar() {
   });
   $('calidad').addEventListener('change', function () { guardar('rm_calidad', Number($('calidad').value)); pintar(); });
 
-  async function cargar() {
-    var cache = leer('rm_cache', null);
-    if (cache && cache.lista && Date.now() - cache.t < CACHE_MS) return cache.lista;
-    var ultimo = new Error('Sin respuesta');
+  var RUTAS_LOCALES = [
+    '/json/stations/search?countrycode=MX&state=Quer&hidebroken=true&order=clickcount&reverse=true&limit=100',
+    '/json/stations/search?countrycode=MX&name=Miled&hidebroken=true&order=clickcount&reverse=true&limit=10',
+    '/json/stations/search?countrycode=MX&name=Tkiss&hidebroken=true&order=clickcount&reverse=true&limit=10',
+    '/json/stations/search?countrycode=MX&name=K%20Digital&hidebroken=true&order=clickcount&reverse=true&limit=10'
+  ];
+
+  async function traer(ruta) {
     for (var i = 0; i < SERVIDORES.length; i++) {
       try {
-        var r = await fetch(SERVIDORES[i] + RUTA);
+        var r = await fetch(SERVIDORES[i] + ruta);
         if (!r.ok) throw new Error('HTTP ' + r.status);
-        var lista = normalizar(await r.json());
-        if (!lista.length) throw new Error('Lista vacía');
-        guardar('rm_cache', { t: Date.now(), lista: lista });
-        return lista;
-      } catch (e) { ultimo = e; }
+        return await r.json();
+      } catch (e) {}
     }
-    if (cache && cache.lista) return cache.lista;
-    throw ultimo;
+    throw new Error('Sin respuesta');
   }
+
+  function unir(listas) {
+    var vistos = {}, salida = [];
+    listas.forEach(function (l) {
+      (l || []).forEach(function (e) {
+        var k = e.nombre.toLowerCase();
+        if (vistos['i' + e.id] || vistos['n' + k]) return;
+        vistos['i' + e.id] = true;
+        vistos['n' + k] = true;
+        salida.push(e);
+      });
+    });
+    return salida;
+  }
+
+  async function cargar() {
+    try { localStorage.removeItem('rm_cache'); } catch (e) {}
+    var cache = leer('rm_cache2', null);
+    if (cache && cache.lista && Date.now() - cache.t < CACHE_MS) return cache.lista;
+    var pedidos = [traer(RUTA)].concat(RUTAS_LOCALES.map(function (r) {
+      return traer(r).catch(function () { return []; });
+    }));
+    var res;
+    try { res = await Promise.all(pedidos); } catch (e) {
+      if (cache && cache.lista) return cache.lista;
+      throw e;
+    }
+    var top = normalizar(res[0]);
+    if (!top.length) {
+      if (cache && cache.lista) return cache.lista;
+      throw new Error('Lista vacía');
+    }
+    var locales = res.slice(1).map(normalizar);
+    var lista = unir(locales.concat([top]));
+    guardar('rm_cache2', { t: Date.now(), lista: lista });
+    return lista;
+  }
+
+  $('pAgregar').addEventListener('click', function () {
+    var nombre = $('pNombre').value.trim();
+    var url = $('pUrl').value.trim();
+    var msg = $('pMsg');
+    if (!nombre) { msg.textContent = 'Escribe un nombre.'; return; }
+    if (url.indexOf('https://') !== 0) { msg.textContent = 'El enlace debe empezar con https://'; return; }
+    try { new URL(url); } catch (e) { msg.textContent = 'El enlace no es válido.'; return; }
+    propias.unshift({ id: 'propia-' + Date.now(), nombre: nombre, url: url, https: true, kbps: 0, codec: '', estado: 'Agregada por ti', propia: true });
+    guardar('rm_propias', propias);
+    $('pNombre').value = '';
+    $('pUrl').value = '';
+    msg.textContent = 'Agregada.';
+    pintar();
+  });
 
   cargar().then(function (l) { estaciones = l; pintar(); })
     .catch(function () { $('estado').textContent = 'No se pudo cargar el directorio. Revisa tu conexión.'; });
