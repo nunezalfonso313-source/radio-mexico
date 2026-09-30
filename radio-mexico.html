@@ -74,6 +74,8 @@ var RUTA = '/json/stations/search?countrycode=MX&hidebroken=true&order=clickcoun
 var KBPS_DEFECTO = 64;
 var MAX_VISIBLES = 200;
 var CACHE_MS = 24 * 3600 * 1000;
+var MAX_INTENTOS = 5;
+var ESPERA_MS = 15000;
 
 /* ---------- Lógica pura (se prueba aparte) ---------- */
 function normalizar(raw) {
@@ -131,6 +133,10 @@ function iniciar() {
   var actual = null;
   var t0 = null;
   var timerConteo = null;
+  var quiereSonar = false;
+  var intentos = 0;
+  var timerReintento = null;
+  var timerEspera = null;
 
   $('calidad').value = String(leer('rm_calidad', 128));
   pintarMB();
@@ -158,30 +164,120 @@ function iniciar() {
 
   function estado(txt) { $('rEstado').textContent = txt; }
 
+  function registrar(ev) {
+    var log = leer('rm_log', []);
+    var d = new Date();
+    var hora = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2);
+    log.push(hora + ' ' + ev);
+    guardar('rm_log', log.slice(-25));
+  }
+
+  function limpiarTimers() {
+    clearTimeout(timerReintento); timerReintento = null;
+    clearTimeout(timerEspera); timerEspera = null;
+  }
+
+  function conectar() {
+    if (!actual) return;
+    audio.src = actual.url;
+    audio.load();
+    var p = audio.play();
+    if (p && p.catch) p.catch(function () { registrar('play rechazado'); });
+  }
+
+  function reintentar(motivo) {
+    if (!quiereSonar || !actual || timerReintento) return;
+    if (intentos >= MAX_INTENTOS) {
+      registrar('sin mas reintentos');
+      quiereSonar = false;
+      estado('Se perdió la conexión. Toca ▶ para reintentar.');
+      return;
+    }
+    intentos++;
+    registrar(motivo + ' -> reintento ' + intentos);
+    estado('Reconectando (' + intentos + ')…');
+    timerReintento = setTimeout(function () {
+      timerReintento = null;
+      if (quiereSonar && actual) conectar();
+    }, Math.min(2000 * intentos, 10000));
+  }
+
   function reproducir(e) {
     detenerConteo();
+    limpiarTimers();
     actual = e;
-    audio.src = e.url;
+    quiereSonar = true;
+    intentos = 0;
     $('rNombre').textContent = e.nombre;
     estado('Conectando…');
-    audio.play().catch(function () { estado('No se pudo reproducir. Prueba otra emisora.'); });
+    registrar('elegida: ' + e.nombre);
+    conectar();
     if ('mediaSession' in navigator && window.MediaMetadata) {
       navigator.mediaSession.metadata = new MediaMetadata({ title: e.nombre, artist: 'Radio México' });
-      navigator.mediaSession.setActionHandler('play', function () { audio.play(); });
-      navigator.mediaSession.setActionHandler('pause', function () { audio.pause(); });
+      navigator.mediaSession.setActionHandler('play', function () { quiereSonar = true; intentos = 0; limpiarTimers(); conectar(); });
+      navigator.mediaSession.setActionHandler('pause', function () { quiereSonar = false; limpiarTimers(); audio.pause(); });
     }
     pintar();
   }
 
-  audio.addEventListener('playing', function () { estado('Reproduciendo' + (actual && actual.kbps ? ' · ' + actual.kbps + ' kbps' : '')); iniciarConteo(); $('btnPlay').textContent = '⏸'; });
-  audio.addEventListener('pause', function () { estado('En pausa'); detenerConteo(); $('btnPlay').textContent = '▶'; });
-  audio.addEventListener('waiting', function () { estado('Cargando…'); });
-  audio.addEventListener('ended', function () { detenerConteo(); $('btnPlay').textContent = '▶'; });
-  audio.addEventListener('error', function () { estado('Error con esta emisora. Prueba otra.'); detenerConteo(); $('btnPlay').textContent = '▶'; });
+  audio.addEventListener('playing', function () {
+    limpiarTimers();
+    intentos = 0;
+    registrar('playing');
+    estado('Reproduciendo' + (actual && actual.kbps ? ' · ' + actual.kbps + ' kbps' : ''));
+    iniciarConteo();
+    $('btnPlay').textContent = '⏸';
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+  });
+  audio.addEventListener('pause', function () {
+    registrar('pause' + (quiereSonar ? ' (sistema)' : ' (usuario)'));
+    detenerConteo();
+    $('btnPlay').textContent = '▶';
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+    if (quiereSonar) { reintentar('pausa del sistema'); } else { limpiarTimers(); estado('En pausa'); }
+  });
+  audio.addEventListener('waiting', function () {
+    estado('Cargando…');
+    clearTimeout(timerEspera);
+    timerEspera = setTimeout(function () { timerEspera = null; reintentar('sin datos ' + (ESPERA_MS / 1000) + ' s'); }, ESPERA_MS);
+  });
+  audio.addEventListener('ended', function () {
+    registrar('ended');
+    detenerConteo();
+    $('btnPlay').textContent = '▶';
+    reintentar('fin de transmision');
+  });
+  audio.addEventListener('error', function () {
+    registrar('error');
+    detenerConteo();
+    $('btnPlay').textContent = '▶';
+    if (quiereSonar) { reintentar('error'); } else { estado('Error con esta emisora. Toca ▶ para reintentar.'); }
+  });
+
+  document.addEventListener('visibilitychange', function () {
+    registrar(document.visibilityState);
+    if (document.visibilityState === 'visible' && quiereSonar && audio.paused && !timerReintento) {
+      intentos = 0;
+      conectar();
+    }
+  });
+  window.addEventListener('online', function () {
+    registrar('online');
+    if (quiereSonar && audio.paused && !timerReintento) { intentos = 0; conectar(); }
+  });
+
+  var titulo = document.querySelector('h1');
+  if (titulo) titulo.addEventListener('click', function () {
+    alert(leer('rm_log', []).join('\n') || 'Sin eventos');
+  });
 
   $('btnPlay').addEventListener('click', function () {
     if (!actual) return;
-    if (audio.paused) { audio.play().catch(function () { estado('No se pudo reproducir.'); }); } else { audio.pause(); }
+    if (audio.paused || timerReintento) {
+      quiereSonar = true; intentos = 0; limpiarTimers(); conectar();
+    } else {
+      quiereSonar = false; limpiarTimers(); audio.pause();
+    }
   });
   $('btnReset').addEventListener('click', function () { totalMB = 0; guardar('rm_mb', 0); pintarMB(); });
 
